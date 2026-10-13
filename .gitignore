@@ -1,0 +1,21 @@
+# 向量库：367 MB，可用 python 3_embed.py 重新生成
+chroma_db/
+
+# 切块产物：可用 python 2_chunk.py 重新生成
+chunks_db.json
+chunks_lore.json
+
+# 虚拟环境与 IDE
+.venv/
+.idea/
+__pycache__/
+*.pyc
+
+# 运行日志与对话记录
+llm_log.jsonl
+chat_history.json
+
+# 系统文件
+Thumbs.db
+desktop.ini
+.DS_Store
