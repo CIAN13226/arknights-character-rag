@@ -12,6 +12,8 @@ __pycache__/
 *.pyc
 
 # 运行日志与对话记录
+logs/
+traces.jsonl
 llm_log.jsonl
 chat_history.json
 

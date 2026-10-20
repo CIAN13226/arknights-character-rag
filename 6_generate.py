@@ -144,6 +144,9 @@ def call_llm(system, user, model=MODEL, timeout=300):
     # 之前遇到过「资料里明明有答案，模型却说没有」，但复现不出来——
     # 没有日志就只能靠猜。日志里带上了模型名、prompt 长度、耗时、原始返回，
     # 这些信息足以判断是「模型没看到」「模型看到了但判断错」还是「调用本身出了问题」。
+    #
+    # 说明：这是「按调用」的流水日志，一次提问可能产生多条。
+    # 想知道「一个提问总共调了几次模型」，看 9_observe.py 的 trace（按提问聚合）。
     t0 = time.time()
     log = {"ts": time.strftime("%H:%M:%S"), "model": model,
            "system_len": len(system), "user_len": len(user)}
@@ -151,15 +154,20 @@ def call_llm(system, user, model=MODEL, timeout=300):
         with urllib.request.urlopen(req, timeout=timeout) as r:
             data = json.loads(r.read().decode("utf-8"))
         out = data.get("message", {}).get("content", "")
-        log.update({"elapsed": round(time.time() - t0, 2), "ok": True,
+        elapsed = round(time.time() - t0, 2)
+        log.update({"elapsed": elapsed, "ok": True,
                     "prompt_tokens": data.get("prompt_eval_count"),
                     "output_tokens": data.get("eval_count"),
                     "done_reason": data.get("done_reason"),
                     "reply": out[:200]})
+        _obs_record_llm(elapsed * 1000, data.get("prompt_eval_count"),
+                        data.get("eval_count"), ok=True)
         return out
     except Exception as e:
-        log.update({"elapsed": round(time.time() - t0, 2), "ok": False,
+        elapsed = round(time.time() - t0, 2)
+        log.update({"elapsed": elapsed, "ok": False,
                     "error": f"{type(e).__name__}: {str(e)[:200]}"})
+        _obs_record_llm(elapsed * 1000, ok=False)
         raise
     finally:
         try:
@@ -167,6 +175,31 @@ def call_llm(system, user, model=MODEL, timeout=300):
                 f.write(json.dumps(log, ensure_ascii=False) + "\n")
         except Exception:
             pass
+
+
+# ---------------- 可观测性（Level 1）----------------
+# 用按路径加载的方式引入 9_observe.py，和本文件引入 4_search / 8_router 的做法一致
+# （这些文件名以数字开头，不能直接 import）。
+_obs = None
+
+
+def _observe():
+    global _obs
+    if _obs is None:
+        import importlib.util as _u
+        spec = _u.spec_from_file_location("obs9", os.path.join(BASE, "9_observe.py"))
+        mod = _u.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _obs = mod
+    return _obs
+
+
+def _obs_record_llm(elapsed_ms, prompt_tokens=None, output_tokens=None, ok=True):
+    """call_llm 的埋点钩子：没有活跃 trace 时静默跳过，绝不影响业务。"""
+    try:
+        _observe().record_llm(elapsed_ms, prompt_tokens, output_tokens, ok)
+    except Exception:
+        pass
 
 
 def detect_operators(question, hits):
@@ -555,8 +588,37 @@ def generate(question, model, emb, client, lib="both", k=None,
       两条路径必须共用同一份逻辑，否则这种「修了一半」的问题会反复出现。
 
     返回 dict：reply / hits / route / notes / structured_text
+
+    【可观测性】
+      进门就开一条 trace，四条返回路径（结构化 / 章节 / 向量 / 拒答）全部经 _done()
+      收尾，保证任何一条路径都留下完整记录。异常也记，然后原样抛出。
     """
     import importlib.util as _u
+    obs = _observe()
+    tr = obs.start_trace(question, lib=lib, k=k, rerank=use_rerank)
+
+    def _done(payload):
+        """统一收尾：写 trace 后返回原 payload，保证不漏任何返回路径。"""
+        try:
+            tr.finish(answer=payload.get("reply"))
+        except Exception:
+            pass
+        return payload
+
+    try:
+        return _generate_body(question, model, emb, client, lib, k,
+                             use_rerank, verbose, tr, obs, _u, _done)
+    except Exception as e:
+        try:
+            tr.finish(error=f"{type(e).__name__}: {e}")
+        except Exception:
+            pass
+        raise
+
+
+def _generate_body(question, model, emb, client, lib, k, use_rerank,
+                   verbose, tr, obs, _u, _done):
+    """generate() 的实际实现。拆出来只是为了给 trace 一个统一的收尾点。"""
     k = k or TOP_K
     notes = []
 
@@ -566,9 +628,15 @@ def generate(question, model, emb, client, lib="both", k=None,
     spec = _u.spec_from_file_location("r8", os.path.join(BASE, "8_router.py"))
     r8 = _u.module_from_spec(spec)
     spec.loader.exec_module(r8)
-    if r8.detect_intent(question) in ("list", "rank"):
+    _t_router = time.time()
+    intent = r8.detect_intent(question)
+    tr.stage("route", intent=intent,
+             elapsed_ms=int((time.time() - _t_router) * 1000))
+
+    if intent in ("list", "rank"):
         text, desc = r8.run_structured(question)
         if text:
+            tr.stage("route", intent=intent, branch="structured", reason=desc)
             notes.append(f"走结构化查询（{desc}）")
             # 表格类结果不能让模型「概括」——实测它会把 5 人压成 1 人。
             reply = call_llm(
@@ -580,8 +648,8 @@ def generate(question, model, emb, client, lib="both", k=None,
                 f"【查询结果】\n{text}\n\n【问题】\n{question}\n\n"
                 f"请逐条列出查询结果里的每一行，不要遗漏。",
                 model=model)
-            return {"reply": reply, "hits": [], "route": "structured",
-                    "notes": notes, "structured_text": text}
+            return _done({"reply": reply, "hits": [], "route": "structured",
+                          "notes": notes, "structured_text": text})
 
     # ---------- 第一层补充：章节补齐 ----------
     # 「凯尔希有什么技能」这类问题问的是「该干员某章节的全部内容」。
@@ -603,26 +671,47 @@ def generate(question, model, emb, client, lib="both", k=None,
         if sec_hits:
             # 把章节内容按 item 排一下序，让 1/2/3 技能按顺序出现
             sec_hits.sort(key=lambda h: (h[1].get("section") or "", h[1].get("item") or ""))
+            tr.stage("route", intent=intent, branch="section",
+                     reason=f"{sec_op} · {sec_name}")
+            tr.stage("section", operator=sec_op, section=sec_name,
+                     chunks=len(sec_hits),
+                     hits=obs.hit_summary(sec_hits, limit=20))
             notes.append(f"识别为章节查询：把「{sec_op} · {sec_name}」下的 "
                          f"{len(sec_hits)} 个块全部取出（不靠相似度排序）")
             reply = call_llm(
                 SYSTEM_PROMPT,
                 USER_TEMPLATE.format(context=build_context(sec_hits), question=question),
                 model=model)
-            return {"reply": reply, "hits": sec_hits, "route": "section",
-                    "notes": notes, "structured_text": None}
+            return _done({"reply": reply, "hits": sec_hits, "route": "section",
+                          "notes": notes, "structured_text": None})
 
     # ---------- 第二层：向量检索 ----------
     # 先扫一遍确定涉及哪些干员（多干员问题要都保留，比如「伊内丝和W的关系」）
     ops = detect_operators_by_scan(question, emb, client, lib)
-    hits = s4.search(emb, client, question, lib, k, rerank=use_rerank)
+    _t_search = time.time()
+    diag = {}
+    hits = s4.search(emb, client, question, lib, k, rerank=use_rerank, diag=diag)
+    _search_ms = int((time.time() - _t_search) * 1000)
+    tr.stage("route", intent=intent, branch="vector")
+    tr.stage("retrieval",
+             query=question,
+             recall_k=diag.get("recall_k"),
+             candidates=diag.get("candidates"),
+             returned=len(hits),
+             empty=not hits,
+             top1=round(float(hits[0][0]), 4) if hits else None,
+             rerank_used=diag.get("rerank_used"),
+             elapsed_ms=_search_ms,
+             hits=obs.hit_summary(hits, diag.get("vec_ranks")))
+
     if not hits:
-        return {"reply": "检索没有返回任何结果。", "hits": [], "route": "vector",
-                "notes": notes, "structured_text": None}
+        return _done({"reply": "检索没有返回任何结果。", "hits": [], "route": "vector",
+                      "notes": notes, "structured_text": None})
     if not ops:
         ops = detect_operators(question, hits)
 
     all_hits = filter_hits(hits, ops)
+    tr.stage("filter", operators=ops, dropped=len(hits) - len(all_hits))
     if len(hits) - len(all_hits):
         notes.append(f"过滤掉 {len(hits)-len(all_hits)} 条不属于"
                      f"「{'、'.join(ops)}」的资料")
@@ -633,16 +722,20 @@ def generate(question, model, emb, client, lib="both", k=None,
     all_hits = boost_answer_chunk(question, all_hits)
 
     filtered, cut = adaptive_cut(all_hits)
+    tr.stage("cut", kept=len(filtered), dropped=cut,
+             kept_hits=obs.hit_summary(filtered, limit=10))
     if cut:
         notes.append(f"按分数台阶砍掉 {cut} 条低相关资料")
 
     best = filtered[0][0] if filtered else 0.0
     threshold = MIN_SCORE_RERANK if s4.RERANK_ON else MIN_SCORE
     if best < threshold:
-        return {"reply": f"参考资料里没有相关信息。\n\n"
-                         f"（最相关的资料得分 {best:.3f}，低于阈值 {threshold}）",
-                "hits": filtered, "route": "vector", "notes": notes,
-                "structured_text": None}
+        tr.stage("refusal", reason="below_threshold", best=round(float(best), 4),
+                 threshold=float(threshold))
+        return _done({"reply": f"参考资料里没有相关信息。\n\n"
+                               f"（最相关的资料得分 {best:.3f}，低于阈值 {threshold}）",
+                      "hits": filtered, "route": "vector", "notes": notes,
+                      "structured_text": None})
 
     # ---------- 第四层：生成 ----------
     reply = call_llm(SYSTEM_PROMPT,
@@ -658,13 +751,20 @@ def generate(question, model, emb, client, lib="both", k=None,
             reply, how = out2, how2
     if SELF_CHECK_ON:
         reply, fixed = self_check(reply, question, model, filtered, verbose)
+        tr.stage("selfcheck", verdict="fixed" if fixed else "pass")
         if fixed:
             how = (how + "；" if how else "") + "经自检修正"
     if how:
+        tr.stage("rescue", how=how)
         notes.append(f"补救：{how}")
 
-    return {"reply": reply, "hits": filtered, "route": "vector",
-            "notes": notes, "structured_text": None}
+    # 有高分资料、模型却拒答——这种才是可疑的（低于阈值的拒答是正常行为）
+    if looks_like_refusal(reply):
+        tr.stage("refusal", reason="model_refused", best=round(float(best), 4),
+                 threshold=float(threshold))
+
+    return _done({"reply": reply, "hits": filtered, "route": "vector",
+                  "notes": notes, "structured_text": None})
 
 
 def answer(model, client, question, lib="both", verbose=True):

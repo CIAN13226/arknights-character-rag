@@ -111,10 +111,10 @@ def load_model():
     return m
 
 
-def search(model, client, query, lib="both", k=5, rerank=None):
+def search(model, client, query, lib="both", k=5, rerank=None, diag=None):
     """两阶段检索，返回 [(分数, 元数据, 文本)]。
 
-    为什么要两阶段：
+    为什么用两阶段：
       第一阶段（向量召回）快，但排序粗——短块因为关键词密度高，
         相似度往往虚高，会把真正的长答案挤到十几名开外。
         实测问「凯尔希有什么技能」，两个技能块排在第 14 和 16 位。
@@ -123,6 +123,10 @@ def search(model, client, query, lib="both", k=5, rerank=None):
 
     rerank 参数：None 表示跟随 RERANK_ON 的全局设置，
                 True/False 可强制开关。
+    diag 参数：传一个 dict 进来，函数会把本次检索的诊断信息填进去
+              （召回候选数、候选总数、是否重排、每条最终结果的"重排前向量排名"）。
+              **重排前的排名只在内存里存在，跑完就没了**，不在这里记就永久丢失，
+              所以可观测性必须在检索这一层取数。
     """
     use_rerank = RERANK_ON if rerank is None else rerank
     # 开了重排就先多召回一些候选，否则精排没有选择的余地
@@ -150,6 +154,9 @@ def search(model, client, query, lib="both", k=5, rerank=None):
             hits.append((1.0 - dist, meta, doc))
 
     hits.sort(key=lambda x: -x[0])
+
+    # 重排前的向量排名快照（按 doc 前 80 字做标识，和下面合并去重用的键一致）
+    vec_order = [doc[:80] for _, _, doc in hits]
 
     if use_rerank and hits:
         try:
@@ -198,7 +205,25 @@ def search(model, client, query, lib="both", k=5, rerank=None):
         except Exception as e:
             print(f"  [警告] 重排失败，退回向量排序：{type(e).__name__}: {e}")
 
-    return hits[:k]
+    final = hits[:k]
+
+    # 把诊断信息交出去（只在调用方传了 diag 时才做，不影响其他调用方）
+    if diag is not None:
+        try:
+            vec_ranks = []
+            for _, _, doc in final:
+                key = doc[:80]
+                vec_ranks.append(vec_order.index(key) + 1 if key in vec_order else None)
+            diag.update({
+                "recall_k": fetch_k,
+                "candidates": len(vec_order),
+                "rerank_used": bool(use_rerank),
+                "vec_ranks": vec_ranks,
+            })
+        except Exception:
+            pass
+
+    return final
 
 
 def show(query, hits, k):

@@ -351,9 +351,18 @@ def parse_faction(wt):
         pat = "|".join(re.escape(s) for s in seps)
         return [x.strip() for x in re.split(pat, v) if x.strip()]
 
-    # 所属势力用逗号分隔（表示层级），隐藏势力用 ;; 分隔（表示并列）
+    # 所属势力用逗号分隔（表示层级）
     owned = split_multi(p.get("所属势力", ""), [",", "，", "、"])
-    hidden = split_multi(p.get("隐藏势力", ""), [";;", ";"])
+
+    # 隐藏势力的写法有两种，都要处理：
+    #   并列：炎;;维多利亚          -> 分号分隔
+    #   层级：谢拉格,喀兰贸易        -> 逗号分隔（7 个干员是这种，早先只按分号切，漏了）
+    # 所以先按分号分组，每组再按逗号拆。最终返回扁平列表，
+    # 层级信息在仓库侧不保留（dim_faction 的隐藏势力 faction_level 记 NULL）。
+    hidden_groups = split_multi(p.get("隐藏势力", ""), [";;", ";"])
+    hidden = []
+    for g in hidden_groups:
+        hidden.extend(split_multi(g, [",", "，", "、"]))
     return owned, hidden
 
 
