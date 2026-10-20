@@ -205,6 +205,80 @@ def hit_summary(hits, vec_ranks=None, limit=8, preview_len=100):
 
 # ---------------- CLI ----------------
 
+def trace_markdown(r, verbose=True, hit_limit=6):
+    """把一条 trace 渲染成 Markdown。给看板（10_dashboard.py）用。
+
+    和 _print_trace 是两个渲染器，但取的是同一条记录、同一套字段：
+    终端要紧凑对齐，网页要能折叠和着色，硬合成一个输出格式两边都别扭。
+
+    排版说明：标量字段用「行尾两个空格」做硬换行（GFM 语法），
+    命中的表格单独成段（markdown 表格前后必须有空行，否则渲染不出来）。
+    """
+    info = []        # 标量字段，最后用硬换行连成一段
+    info.append(f"**trace_id** `{r.get('trace_id')}`　**时间** {r.get('ts')}")
+    info.append(f"**问题** {r.get('question')}")
+    meta = r.get("meta") or {}
+    if meta:
+        info.append(f"**参数** `{meta}`")
+    info.append(f"**总耗时** {r.get('elapsed_ms')} ms")
+
+    route = r.get("route") or {}
+    if route:
+        info.append(f"**路由** intent={route.get('intent')}　branch={route.get('branch')}")
+    sec = r.get("section")
+    if sec:
+        info.append(f"**章节查询** {sec.get('operator')} · {sec.get('section')}"
+                    f"（{sec.get('chunks')} 块）")
+    ret = r.get("retrieval") or {}
+    if ret:
+        info.append(f"**检索** 召回候选 {ret.get('candidates')}　返回 {ret.get('returned')}　"
+                    f"top1={ret.get('top1')}　重排={ret.get('rerank_used')}　"
+                    f"空={ret.get('empty')}　耗时 {ret.get('elapsed_ms')} ms")
+    flt = r.get("filter")
+    if flt:
+        info.append(f"**干员过滤** {flt.get('operators')}　丢弃 {flt.get('dropped')}")
+    cut = r.get("cut")
+    if cut:
+        info.append(f"**分数裁剪** 保留 {cut.get('kept')}　丢弃 {cut.get('dropped')}")
+    ref = r.get("refusal")
+    if ref:
+        info.append(f"**拒答** 原因={ref.get('reason')}　best={ref.get('best')}")
+    llm = r.get("llm")
+    if llm:
+        err = f"　失败 {llm.get('errors')} 次" if llm.get("errors") else ""
+        info.append(f"**模型调用** {llm.get('calls')} 次　prompt {llm.get('prompt_tokens')} tok　"
+                    f"输出 {llm.get('output_tokens')} tok　耗时 {llm.get('elapsed_ms')} ms{err}")
+    rescue = r.get("rescue")
+    if rescue:
+        info.append(f"**补救** {rescue.get('how')}")
+    sc = r.get("selfcheck")
+    if sc:
+        info.append(f"**自检** {sc.get('verdict')}")
+
+    blocks = ["  \n".join(info)]
+
+    hits = ret.get("hits") or []
+    if verbose and hits:
+        rows = ["| # | 分数 | chunk_id | 向量排名 | 来源 |",
+                "|---:|---:|:---|:---|:---|"]
+        for h in hits[:hit_limit]:
+            vr = h.get("vec_rank")
+            vr_s = f"第{vr}名" if vr else "重排新进"
+            origin = "向量保底" if h.get("origin") == "vec_boost" else "重排"
+            rows.append(f"| {h.get('rank')} | {h.get('score')} | `{h.get('chunk_id')}` "
+                        f"| {vr_s} | {origin} |")
+        blocks.append("\n".join(rows))
+
+    tail = [f"**回答** {r.get('answer_preview') or ''}"]
+    if r.get("error"):
+        tail.append(f"**异常** `{r.get('error')}`")
+    flags = r.get("flags") or []
+    tail.append(f"**可疑标记** {'、'.join(flags) if flags else '无'}")
+    blocks.append("  \n".join(tail))
+
+    return "\n\n".join(blocks)
+
+
 def _read_traces(path=TRACE_FILE):
     if not os.path.exists(path):
         return []
