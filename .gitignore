@@ -11,6 +11,9 @@ chunks_lore.json
 __pycache__/
 *.pyc
 
+# 临时文件
+_msg.txt
+
 # 个人笔记，不公开
 面试问答梳理.md
 
