@@ -39,7 +39,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 TRACE_FILE = os.path.join(BASE, "logs", "traces.jsonl")
 
 # ---- 可疑判定阈值（都可调，写在这里是为了让判定标准可见）----
-LOW_TOP1 = 0.60          # top1 相似度低于此值，疑似检索质量不足
+LOW_TOP1 = 0.70          # top1 相似度低于此值，疑似检索质量不足
 MANY_LLM_CALLS = 3       # 一次请求调模型 >= 3 次，说明首次生成质量差
 LONG_PROMPT = 3500       # prompt token 超过此值，可能被上下文长度截断
 BIG_CUT = 3              # 裁掉 >= 3 个块，可能把含答案的块裁了
@@ -196,6 +196,8 @@ def hit_summary(hits, vec_ranks=None, limit=8, preview_len=100):
             "section": section[:40],
             "score": round(float(score), 4),
             "vec_rank": vr,
+            # rerank = 重排选出的；vec_boost = 重排没选但向量召回补进来的保底
+            "origin": meta.get("_origin"),
             "preview": text[:preview_len].replace("\n", " "),
         })
     return out
@@ -245,6 +247,8 @@ def _print_trace(r, verbose=True):
             for h in (ret.get("hits") or [])[:6]:
                 vr = h.get("vec_rank")
                 vr_s = f"向量第{vr}名" if vr else "重排新进"
+                if h.get("origin") == "vec_boost":
+                    vr_s += " ·向量保底"
                 print(f"            #{h['rank']} {h['score']:.3f} {h['chunk_id'][:52]:<52} {vr_s}")
 
     flt = r.get("filter")

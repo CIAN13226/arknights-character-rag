@@ -81,13 +81,29 @@ def adaptive_cut(hits, ratio=SCORE_RATIO, hard_cap=MAX_CONTEXT_CHUNKS):
     """按分数台阶自适应保留资料，避免噪声把模型逼到拒答。
 
     返回 (保留后的列表, 被砍掉的数量)
+
+    【两个关键点】
+    ① 台阶基准用「最高分」而不是「第一条的分数」。
+       boost_answer_chunk 会把"最可能含答案"的那条插到最前面，它的分数不一定是最高，
+       拿它当基准会让台阶整体下移、该砍的没砍掉。用 max 才符合"保留 ≥ 最高分×ratio"的本意。
+
+    ② 向量保底的条目（_origin == "vec_boost"）豁免相对台阶。
+       它的分数是重排分（为重排有盲区才靠向量召回补进来的），本来就偏低，
+       按"最高分×ratio"的台阶一定被砍。可它存在的意义正是"重排没选中但向量认为相关"，
+       砍掉它等于把保底机制架空。
+
+       但它仍要过**绝对下限** MIN_SCORE_RERANK：
+       重排分低于这个值的块，等于重排模型在说"完全无关"（实测里有 0.004 这种），
+       那种块不该因为"保底"两个字就一直塞进 prompt。相对台阶可以豁免，绝对底线不行。
     """
     if not hits:
         return hits, 0
-    top = hits[0][0]
+    top = max((h[0] for h in hits), default=0)
     if top <= 0:
         return hits[:hard_cap], max(0, len(hits) - hard_cap)
-    kept = [h for h in hits if h[0] >= top * ratio]
+    kept = [h for h in hits
+            if h[0] >= top * ratio
+            or ((h[1] or {}).get("_origin") == "vec_boost" and h[0] >= MIN_SCORE_RERANK)]
     # 至少留 2 条，避免只剩一条时信息不足
     if len(kept) < 2:
         kept = hits[:2]
@@ -727,7 +743,7 @@ def _generate_body(question, model, emb, client, lib, k, use_rerank,
     if cut:
         notes.append(f"按分数台阶砍掉 {cut} 条低相关资料")
 
-    best = filtered[0][0] if filtered else 0.0
+    best = max((h[0] for h in filtered), default=0.0)
     threshold = MIN_SCORE_RERANK if s4.RERANK_ON else MIN_SCORE
     if best < threshold:
         tr.stage("refusal", reason="below_threshold", best=round(float(best), 4),

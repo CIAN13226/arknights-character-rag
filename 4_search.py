@@ -175,32 +175,50 @@ def search(model, client, query, lib="both", k=5, rerank=None, diag=None):
                 ((float(s), meta, doc) for s, (_, meta, doc) in zip(scores, hits)),
                 key=lambda x: -x[0])
 
+            # 【量纲统一】重排分数是"问题-文档相关性"，向量分数是"语义相似度"，
+            # 两者不可比。合并时如果各带各的分数，下游按"最高分的比例"截断就等于
+            # 用两种尺子量同一条线——向量保底的条目会被系统性当成低分砍掉。
+            # 所以这里建一张索引，保证合并后列表里**每个条目的元素0都是重排分数**。
+            # （重排模型对全部候选都打过分了，所以保底条目也有自己的重排分数。）
+            rk_by_key = {}
+            for s, (_, meta_, doc_) in zip(scores, hits):
+                rk_by_key[doc_[:80]] = float(s)
+
             half = max(1, k // 2)
             merged, seen = [], set()
+
+            def _tag(meta, origin):
+                """给条目打来源标记，让下游知道这条是重排选出的还是向量保底。"""
+                m = dict(meta or {})
+                m["_origin"] = origin
+                return m
+
             # 前半：重排认为最相关的
-            for item in reranked:
+            for score, meta, doc in reranked:
                 if len(merged) >= half:
                     break
-                key = item[2][:80]
+                key = doc[:80]
                 if key not in seen:
                     seen.add(key)
-                    merged.append(item)
+                    merged.append((score, _tag(meta, "rerank"), doc))
             # 后半：向量召回里最相关的（补足保底）
-            for item in vec_top:
+            for _, meta, doc in vec_top:
                 if len(merged) >= k:
                     break
-                key = item[2][:80]
+                key = doc[:80]
                 if key not in seen:
                     seen.add(key)
-                    merged.append(item)
+                    # 分数用重排分（保持量纲一致），来源标成 vec_boost
+                    # 下游 adaptive_cut 会据此豁免它，不让它被台阶砍掉
+                    merged.append((rk_by_key.get(key, 0.0), _tag(meta, "vec_boost"), doc))
             # 还不够就用剩下的重排结果填满
-            for item in reranked:
+            for score, meta, doc in reranked:
                 if len(merged) >= k:
                     break
-                key = item[2][:80]
+                key = doc[:80]
                 if key not in seen:
                     seen.add(key)
-                    merged.append(item)
+                    merged.append((score, _tag(meta, "rerank"), doc))
             hits = merged
         except Exception as e:
             print(f"  [警告] 重排失败，退回向量排序：{type(e).__name__}: {e}")

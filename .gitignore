@@ -11,6 +11,9 @@ chunks_lore.json
 __pycache__/
 *.pyc
 
+# 个人笔记，不公开
+面试问答梳理.md
+
 # 运行日志与对话记录
 logs/
 traces.jsonl
